@@ -194,6 +194,13 @@ impl CaseExpr {
             let when_value = self.when_then_expr[i]
                 .0
                 .evaluate_selection(batch, &remainder)?;
+
+            let when_value = match when_value {
+                ColumnarValue::Scalar(value) if value.is_null() => {
+                    continue;
+                }
+                _ => when_value,
+            };
             let when_value = when_value.into_array(batch.num_rows());
             let when_value = as_boolean_array(&when_value).map_err(|e| {
                 DataFusionError::Context(
@@ -217,8 +224,7 @@ impl CaseExpr {
                 _ => then_value.into_array(batch.num_rows()),
             };
 
-            current_value =
-                zip(&when_value, then_value.as_ref(), current_value.as_ref())?;
+            current_value = zip(&when_value, then_value.as_ref(), current_value.as_ref())?;
 
             // Succeed tuples should be filtered out for short-circuit evaluation,
             // null values for the current when expr should be kept
