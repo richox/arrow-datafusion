@@ -226,6 +226,11 @@ macro_rules! get_null_count_values {
 }
 
 impl<'a> PruningStatistics for RowGroupPruningStatistics<'a> {
+    fn num_rows(&self, _column: &Column) -> Option<ArrayRef> {
+        let num_rows = self.row_group_metadata.num_rows();
+        Some(ScalarValue::UInt64(Some(num_rows as u64)).to_array())
+    }
+
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
         get_min_max_values!(self, column, min, min_bytes)
     }

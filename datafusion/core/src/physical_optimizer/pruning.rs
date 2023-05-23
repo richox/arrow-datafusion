@@ -69,6 +69,9 @@ use log::trace;
 /// min_values("X") -> None
 /// ```
 pub trait PruningStatistics {
+    /// return the number of values (including nulls)
+    fn num_rows(&self, column: &Column) -> Option<ArrayRef>;
+
     /// return the minimum values for the named column, if known.
     /// Note: the returned array must contain `num_containers()` rows
     fn min_values(&self, column: &Column) -> Option<ArrayRef>;
@@ -307,6 +310,16 @@ impl RequiredStatColumns {
         rewrite_column_expr(column_expr.clone(), column, &stat_column)
     }
 
+    /// rewrite col --> col_num_rows
+    fn num_rows_column_expr(
+        &mut self,
+        column: &phys_expr::Column,
+        column_expr: &Arc<dyn PhysicalExpr>,
+        field: &Field,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        self.stat_column_expr(column, column_expr, field, StatisticsType::NumValues, "num_rows")
+    }
+
     /// rewrite col --> col_min
     fn min_column_expr(
         &mut self,
@@ -389,6 +402,7 @@ fn build_statistics_record_batch<S: PruningStatistics>(
         let num_containers = statistics.num_containers();
 
         let array = match statistics_type {
+            StatisticsType::NumValues => statistics.num_rows(&column),
             StatisticsType::Min => statistics.min_values(&column),
             StatisticsType::Max => statistics.max_values(&column),
             StatisticsType::NullCount => statistics.null_counts(&column),
@@ -731,6 +745,38 @@ fn build_is_null_column_expr(
     }
 }
 
+fn build_is_not_null_column_expr(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    required_columns: &mut RequiredStatColumns,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    if let Some(col) = expr.as_any().downcast_ref::<phys_expr::Column>() {
+        let field = schema.field_with_name(col.name()).ok()?;
+
+        let null_count_field = &Field::new(field.name(), DataType::UInt64, true);
+        let null_count_column_expr = required_columns
+            .null_count_column_expr(col, expr, null_count_field);
+
+        let num_rows_field = null_count_field;
+        let num_rows_column_expr = required_columns
+            .num_rows_column_expr(col, expr, num_rows_field);
+
+        match (null_count_column_expr.ok(), num_rows_column_expr.ok()) {
+            (Some(null_count_column_expr), Some(num_rows_column_expr)) => {
+                // IsNotNull(column) => null_count != num_rows
+                Some(Arc::new(phys_expr::BinaryExpr::new(
+                    null_count_column_expr,
+                    Operator::NotEq,
+                    num_rows_column_expr,
+                )))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
 /// Translate logical filter expression into pruning predicate
 /// expression that will evaluate to FALSE if it can be determined no
 /// rows between the min/max values could pass the predicates.
@@ -749,6 +795,10 @@ fn build_predicate_expression(
     let expr_any = expr.as_any();
     if let Some(is_null) = expr_any.downcast_ref::<phys_expr::IsNullExpr>() {
         return build_is_null_column_expr(is_null.arg(), schema, required_columns)
+            .unwrap_or(unhandled);
+    }
+    if let Some(is_not_null) = expr_any.downcast_ref::<phys_expr::IsNotNullExpr>() {
+        return build_is_not_null_column_expr(is_not_null.arg(), schema, required_columns)
             .unwrap_or(unhandled);
     }
     if let Some(col) = expr_any.downcast_ref::<phys_expr::Column>() {
@@ -925,6 +975,7 @@ fn build_statistics_expr(
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum StatisticsType {
+    NumValues,
     Min,
     Max,
     NullCount,
