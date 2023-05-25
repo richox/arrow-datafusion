@@ -47,8 +47,13 @@ use arrow::{
 };
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{downcast_value, ScalarValue};
-use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr::{expressions as phys_expr, PhysicalExprRef};
+use datafusion_expr::BuiltinScalarFunction;
+use datafusion_physical_expr::{
+    utils::collect_columns,
+    execution_props::ExecutionProps,
+    functions::create_physical_fun,
+};
+use datafusion_physical_expr::{expressions as phys_expr, PhysicalExprRef, ScalarFunctionExpr};
 use log::trace;
 
 /// Interface to pass statistics information to [`PruningPredicate`]
@@ -778,6 +783,56 @@ fn build_is_not_null_column_expr(
     }
 }
 
+fn build_starts_with_expr(
+    expr: &Arc<dyn PhysicalExpr>,
+    prefix: &str,
+    schema: &Schema,
+    required_columns: &mut RequiredStatColumns,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    if let Some(col) = expr.as_any().downcast_ref::<phys_expr::Column>() {
+        let field = schema.field_with_name(col.name()).ok()?;
+
+        let min_field = &Field::new(field.name(), DataType::UInt64, true);
+        let min_column_expr = required_columns.min_column_expr(col, expr, min_field).ok()?;
+
+        let max_field = &min_field.clone();
+        let max_column_expr = required_columns.max_column_expr(col, expr, max_field).ok()?;
+
+        let lit_prefix = phys_expr::lit(prefix.to_owned());
+        let lit_1 = phys_expr::lit(1i64);
+        let lit_len = phys_expr::lit(prefix.len() as i64);
+
+        let execution_props = ExecutionProps::new();
+        let substr_fn = create_physical_fun(
+            &BuiltinScalarFunction::Substr,
+            &execution_props,
+        ).ok()?;
+
+        let min_prefix = Arc::new(ScalarFunctionExpr::new(
+            "substr",
+            substr_fn.clone(),
+            vec![min_column_expr, lit_1.clone(), lit_len.clone()],
+            &DataType::Utf8,
+        ));
+        let max_prefix = Arc::new(ScalarFunctionExpr::new(
+            "substr",
+            substr_fn.clone(),
+            vec![max_column_expr, lit_1.clone(), lit_len.clone()],
+            &DataType::Utf8,
+        ));
+
+        phys_expr::binary(
+            phys_expr::binary(min_prefix, Operator::LtEq, lit_prefix.clone(), schema).ok()?,
+            Operator::And,
+            phys_expr::binary(max_prefix, Operator::GtEq, lit_prefix.clone(), schema).ok()?,
+            schema,
+        ).ok()
+
+    } else {
+        None
+    }
+}
+
 /// Translate logical filter expression into pruning predicate
 /// expression that will evaluate to FALSE if it can be determined no
 /// rows between the min/max values could pass the predicates.
@@ -844,6 +899,19 @@ fn build_predicate_expression(
         } else {
             return unhandled;
         }
+    }
+    if let Some(scalar_fn) = expr_any.downcast_ref::<ScalarFunctionExpr>() {
+        if scalar_fn.name() == "starts_with" {
+            let arg1 = &scalar_fn.args()[0];
+            let arg2 = &scalar_fn.args()[1];
+            if let Some(literal) = arg2.as_any().downcast_ref::<phys_expr::Literal>() {
+                if let ScalarValue::Utf8(Some(prefix)) = literal.value() {
+                    return build_starts_with_expr(arg1, prefix, schema, required_columns)
+                        .unwrap_or(unhandled);
+                }
+            }
+        }
+        return unhandled;
     }
 
     let (left, op, right) = {
