@@ -734,17 +734,19 @@ fn build_is_null_column_expr(
         let field = schema.field_with_name(col.name()).ok()?;
 
         let null_count_field = &Field::new(field.name(), DataType::UInt64, true);
-        required_columns
-            .null_count_column_expr(col, expr, null_count_field)
-            .map(|null_count_column_expr| {
-                // IsNull(column) => null_count > 0
-                Arc::new(phys_expr::BinaryExpr::new(
-                    null_count_column_expr,
-                    Operator::Gt,
-                    Arc::new(phys_expr::Literal::new(ScalarValue::UInt64(Some(0)))),
-                )) as _
-            })
-            .ok()
+        let null_count_column_expr = required_columns
+            .null_count_column_expr(col, expr, null_count_field).ok()?;
+
+        // IsNull(column) => null_count is null or null_count > 0
+        let is_null = phys_expr::is_null(null_count_column_expr.clone()).ok()?;
+        let gt_0 = phys_expr::binary(
+            null_count_column_expr,
+            Operator::Gt,
+            phys_expr::lit(0u64),
+            schema,
+        ).ok()?;
+        phys_expr::binary(is_null, Operator::Or, gt_0, schema).ok()
+
     } else {
         None
     }
@@ -760,23 +762,22 @@ fn build_is_not_null_column_expr(
 
         let null_count_field = &Field::new(field.name(), DataType::UInt64, true);
         let null_count_column_expr = required_columns
-            .null_count_column_expr(col, expr, null_count_field);
+            .null_count_column_expr(col, expr, null_count_field).ok()?;
 
         let num_rows_field = null_count_field;
         let num_rows_column_expr = required_columns
-            .num_rows_column_expr(col, expr, num_rows_field);
+            .num_rows_column_expr(col, expr, num_rows_field).ok()?;
 
-        match (null_count_column_expr.ok(), num_rows_column_expr.ok()) {
-            (Some(null_count_column_expr), Some(num_rows_column_expr)) => {
-                // IsNotNull(column) => null_count != num_rows
-                Some(Arc::new(phys_expr::BinaryExpr::new(
-                    null_count_column_expr,
-                    Operator::NotEq,
-                    num_rows_column_expr,
-                )))
-            }
-            _ => None,
-        }
+        // IsNotNull(column) => null_count is null or null_count != num_rows
+        let is_null = phys_expr::is_null(null_count_column_expr.clone()).ok()?;
+        let ne = phys_expr::binary(
+            null_count_column_expr,
+            Operator::NotEq,
+            num_rows_column_expr,
+            schema,
+        ).ok()?;
+        phys_expr::binary(is_null, Operator::Or, ne, schema).ok()
+
     } else {
         None
     }

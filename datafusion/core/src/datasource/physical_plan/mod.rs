@@ -501,8 +501,11 @@ impl SchemaAdapter {
         let mut field_mappings = vec![None; self.table_schema.fields().len()];
 
         for (file_idx, file_field) in file_schema.fields.iter().enumerate() {
-            if let Some((table_idx, table_field)) =
-                self.table_schema.fields().find(file_field.name())
+            if let Some((table_idx, table_field)) = self.table_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .find(|(_, b)| b.name().eq_ignore_ascii_case(name))
             {
                 match can_cast_types(file_field.data_type(), table_field.data_type()) {
                     true => {
@@ -593,7 +596,11 @@ impl PartitionColumnProjector {
     fn new(projected_schema: SchemaRef, table_partition_cols: &[String]) -> Self {
         let mut idx_map = HashMap::new();
         for (partition_idx, partition_name) in table_partition_cols.iter().enumerate() {
-            if let Ok(schema_idx) = projected_schema.index_of(partition_name) {
+            if let Some(schema_idx) = projected_schema
+                .fields()
+                .iter()
+                .position(|f| partition_name.eq_ignore_ascii_case(f.name()))
+            {
                 idx_map.insert(partition_idx, schema_idx);
             }
         }
