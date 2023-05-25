@@ -167,7 +167,7 @@ pub struct FileScanConfig {
 
 impl FileScanConfig {
     /// Project the schema and the statistics on the given column indices
-    fn project(&self) -> (SchemaRef, Statistics, Vec<LexOrdering>) {
+    pub fn project(&self) -> (SchemaRef, Statistics, Vec<LexOrdering>) {
         if self.projection.is_none() && self.table_partition_cols.is_empty() {
             return (
                 Arc::clone(&self.file_schema),
@@ -222,7 +222,7 @@ impl FileScanConfig {
     }
 
     #[allow(unused)] // Only used by avro
-    fn projected_file_column_names(&self) -> Option<Vec<String>> {
+    pub fn projected_file_column_names(&self) -> Option<Vec<String>> {
         self.projection.as_ref().map(|p| {
             p.iter()
                 .filter(|col_idx| **col_idx < self.file_schema.fields().len())
@@ -232,7 +232,7 @@ impl FileScanConfig {
         })
     }
 
-    fn file_column_projection_indices(&self) -> Option<Vec<usize>> {
+    pub fn file_column_projection_indices(&self) -> Option<Vec<usize>> {
         self.projection.as_ref().map(|p| {
             p.iter()
                 .filter(|col_idx| **col_idx < self.file_schema.fields().len())
@@ -462,13 +462,13 @@ impl<'a> Display for OutputOrderingDisplay<'a> {
 ///    indexes and insert null-valued columns wherever the file schema was missing a colum present
 ///    in the table schema.
 #[derive(Clone, Debug)]
-pub(crate) struct SchemaAdapter {
+pub struct SchemaAdapter {
     /// Schema for the table
     table_schema: SchemaRef,
 }
 
 impl SchemaAdapter {
-    pub(crate) fn new(table_schema: SchemaRef) -> SchemaAdapter {
+    pub fn new(table_schema: SchemaRef) -> SchemaAdapter {
         Self { table_schema }
     }
 
@@ -476,7 +476,7 @@ impl SchemaAdapter {
     /// file schema
     ///
     /// Panics if index is not in range for the table schema
-    pub(crate) fn map_column_index(
+    pub fn map_column_index(
         &self,
         index: usize,
         file_schema: &Schema,
@@ -576,7 +576,7 @@ impl SchemaMapping {
 /// dictionaries. Indeed, the partition columns are constant, so the dictionaries that represent them
 /// have all their keys equal to 0. This enables us to re-use the same "all-zero" buffer across batches,
 /// which makes the space consumption of the partition columns O(batch_size) instead of O(record_count).
-struct PartitionColumnProjector {
+pub struct PartitionColumnProjector {
     /// An Arrow buffer initialized to zeros that represents the key array of all partition
     /// columns (partition columns are materialized by dictionary arrays with only one
     /// value in the dictionary, thus all the keys are equal to zero).
@@ -593,7 +593,7 @@ impl PartitionColumnProjector {
     // Create a projector to insert the partitioning columns into batches read from files
     // - `projected_schema`: the target schema with both file and partitioning columns
     // - `table_partition_cols`: all the partitioning column names
-    fn new(projected_schema: SchemaRef, table_partition_cols: &[String]) -> Self {
+    pub fn new(projected_schema: SchemaRef, table_partition_cols: &[String]) -> Self {
         let mut idx_map = HashMap::new();
         for (partition_idx, partition_name) in table_partition_cols.iter().enumerate() {
             if let Some(schema_idx) = projected_schema
@@ -619,7 +619,7 @@ impl PartitionColumnProjector {
     // to the right positions as deduced from `projected_schema`
     // - `file_batch`: batch read from the file, with internal projection applied
     // - `partition_values`: the list of partition values, one for each partition column
-    fn project(
+    pub fn project(
         &mut self,
         file_batch: RecordBatch,
         partition_values: &[ScalarValue],
