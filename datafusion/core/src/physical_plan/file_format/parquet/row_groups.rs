@@ -44,7 +44,7 @@ use super::ParquetFileMetrics;
 ///
 /// If an index IS present in the returned Vec it means the predicate
 /// did not filter out that row group.
-pub(crate) fn prune_row_groups(
+pub fn prune_row_groups(
     groups: &[RowGroupMetaData],
     range: Option<FileRange>,
     predicate: Option<&PruningPredicate>,
@@ -94,7 +94,7 @@ pub(crate) fn prune_row_groups(
 
 /// Wraps parquet statistics in a way
 /// that implements [`PruningStatistics`]
-struct RowGroupPruningStatistics<'a> {
+pub struct RowGroupPruningStatistics<'a> {
     row_group_metadata: &'a RowGroupMetaData,
     parquet_schema: &'a Schema,
 }
