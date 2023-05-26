@@ -405,13 +405,10 @@ impl SchemaAdapter {
                 .iter()
                 .position(|f| field.name().eq_ignore_ascii_case(f.name()))
             {
-                if file_schema.field(mapped_idx).data_type() == field.data_type() {
-                    mapped.push(mapped_idx)
-                } else {
-                    let msg = format!("Failed to map column projection for field {}. Incompatible data types {:?} and {:?}", field.name(), file_schema.field(mapped_idx).data_type(), field.data_type());
-                    info!("{}", msg);
-                    return Err(DataFusionError::Execution(msg));
-                }
+                // blaze:
+                // accept columns even if data types are not matched, columns are
+                // later casted into correct types using schema_adapter_cast_column()
+                mapped.push(mapped_idx)
             }
         }
         Ok(mapped)
@@ -440,7 +437,21 @@ impl SchemaAdapter {
                 .enumerate()
                 .find(|&(_, c)| c.name().eq_ignore_ascii_case(table_field.name()))
             {
-                cols.push(batch_cols[batch_idx].clone());
+                // blaze:
+                // cast to target data type before adding columns
+                extern "Rust" {
+                    fn schema_adapter_cast_column(
+                        col: &ArrayRef,
+                        data_type: &DataType,
+                    ) -> Result<ArrayRef>;
+                }
+
+                cols.push(unsafe {
+                    schema_adapter_cast_column(
+                        &batch_cols[batch_idx],
+                        table_field.data_type(),
+                    )?
+                });
             } else {
                 cols.push(new_null_array(table_field.data_type(), batch_rows))
             }
