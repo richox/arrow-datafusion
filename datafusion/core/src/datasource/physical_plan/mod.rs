@@ -507,20 +507,8 @@ impl SchemaAdapter {
                 .enumerate()
                 .find(|(_, b)| b.name().eq_ignore_ascii_case(name))
             {
-                match can_cast_types(file_field.data_type(), table_field.data_type()) {
-                    true => {
-                        field_mappings[table_idx] = Some(projection.len());
-                        projection.push(file_idx);
-                    }
-                    false => {
-                        return Err(DataFusionError::Plan(format!(
-                            "Cannot cast file schema field {} of type {:?} to table schema field of type {:?}",
-                            file_field.name(),
-                            file_field.data_type(),
-                            table_field.data_type()
-                        )))
-                    }
-                }
+                field_mappings[table_idx] = Some(projection.len());
+                projection.push(file_idx);
             }
         }
 
@@ -550,13 +538,24 @@ impl SchemaMapping {
         let batch_rows = batch.num_rows();
         let batch_cols = batch.columns().to_vec();
 
+        // blaze:
+        // cast to target data type before adding columns
+        extern "Rust" {
+            fn schema_adapter_cast_column(
+                col: &ArrayRef,
+                data_type: &DataType,
+            ) -> Result<ArrayRef>;
+        }
+
         let cols = self
             .table_schema
             .fields()
             .iter()
             .zip(&self.field_mappings)
             .map(|(field, file_idx)| match file_idx {
-                Some(batch_idx) => cast(&batch_cols[*batch_idx], field.data_type()),
+                Some(batch_idx) => unsafe {
+                    schema_adapter_cast_column(&batch_cols[*batch_idx], field.data_type())
+                }
                 None => Ok(new_null_array(field.data_type(), batch_rows)),
             })
             .collect::<Result<Vec<_>, _>>()?;
