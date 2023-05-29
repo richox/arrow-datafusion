@@ -19,6 +19,8 @@
 
 mod baseline;
 mod builder;
+mod composite;
+mod tracker;
 mod value;
 
 use parking_lot::Mutex;
@@ -33,6 +35,8 @@ use hashbrown::HashMap;
 // public exports
 pub use baseline::{BaselineMetrics, RecordOutput};
 pub use builder::MetricBuilder;
+pub use composite::CompositeMetricsSet;
+pub use tracker::MemTrackingMetrics;
 pub use value::{Count, Gauge, MetricValue, ScopedTimerGuard, Time, Timestamp};
 
 /// Something that tracks a value of interest (metric) of a DataFusion

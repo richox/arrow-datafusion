@@ -28,7 +28,7 @@ use crate::execution::runtime_env::RuntimeEnv;
 use crate::physical_plan::common::{batch_byte_size, spawn_buffered, IPCWriter};
 use crate::physical_plan::expressions::PhysicalSortExpr;
 use crate::physical_plan::metrics::{
-    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+    BaselineMetrics, CompositeMetricsSet, MemTrackingMetrics, MetricsSet,
 };
 use crate::physical_plan::sorts::merge::streaming_merge;
 use crate::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
@@ -36,6 +36,7 @@ use crate::physical_plan::{
     DisplayFormatType, Distribution, EmptyRecordBatchStream, ExecutionPlan, Partitioning,
     SendableRecordBatchStream, Statistics,
 };
+use crate::prelude::SessionConfig;
 pub use arrow::compute::SortOptions;
 use arrow::compute::{concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::SchemaRef;
@@ -55,27 +56,6 @@ use tempfile::NamedTempFile;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task;
 
-struct ExternalSorterMetrics {
-    /// metrics
-    baseline: BaselineMetrics,
-
-    /// count of spills during the execution of the operator
-    spill_count: Count,
-
-    /// total spilled bytes during the execution of the operator
-    spilled_bytes: Count,
-}
-
-impl ExternalSorterMetrics {
-    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
-        Self {
-            baseline: BaselineMetrics::new(metrics, partition),
-            spill_count: MetricBuilder::new(metrics).spill_count(partition),
-            spilled_bytes: MetricBuilder::new(metrics).spilled_bytes(partition),
-        }
-    }
-}
-
 /// Sort arbitrary size of data to get a total order (may spill several times during sorting based on free memory available).
 ///
 /// The basic architecture of the algorithm:
@@ -92,12 +72,13 @@ struct ExternalSorter {
     spills: Vec<NamedTempFile>,
     /// Sort expressions
     expr: Arc<[PhysicalSortExpr]>,
-    metrics: ExternalSorterMetrics,
+    session_config: Arc<SessionConfig>,
+    runtime: Arc<RuntimeEnv>,
+    metrics_set: CompositeMetricsSet,
+    metrics: BaselineMetrics,
     fetch: Option<usize>,
     reservation: MemoryReservation,
     partition_id: usize,
-    runtime: Arc<RuntimeEnv>,
-    batch_size: usize,
 }
 
 impl ExternalSorter {
@@ -105,12 +86,13 @@ impl ExternalSorter {
         partition_id: usize,
         schema: SchemaRef,
         expr: Vec<PhysicalSortExpr>,
-        batch_size: usize,
-        fetch: Option<usize>,
-        metrics: &ExecutionPlanMetricsSet,
+        metrics_set: CompositeMetricsSet,
+        session_config: Arc<SessionConfig>,
         runtime: Arc<RuntimeEnv>,
+        fetch: Option<usize>,
     ) -> Self {
-        let metrics = ExternalSorterMetrics::new(metrics, partition_id);
+        let metrics = metrics_set.new_intermediate_baseline(partition_id);
+
         let reservation = MemoryConsumer::new(format!("ExternalSorter[{partition_id}]"))
             .with_can_spill(true)
             .register(&runtime.memory_pool);
@@ -121,12 +103,13 @@ impl ExternalSorter {
             in_mem_batches_sorted: true,
             spills: vec![],
             expr: expr.into(),
+            session_config,
+            runtime,
+            metrics_set,
             metrics,
             fetch,
             reservation,
             partition_id,
-            runtime,
-            batch_size,
         }
     }
 
@@ -158,7 +141,7 @@ impl ExternalSorter {
                 self.reservation.try_grow(size)?
             }
         }
-
+        self.metrics.mem_used().add(size);
         self.in_mem_batches.push(input);
         self.in_mem_batches_sorted = false;
         Ok(())
@@ -171,10 +154,17 @@ impl ExternalSorter {
     /// MergeSort in mem batches as well as spills into total order with `SortPreservingMergeStream`.
     fn sort(&mut self) -> Result<SendableRecordBatchStream> {
         if self.spilled_before() {
+            let intermediate_metrics = self
+                .metrics_set
+                .new_intermediate_tracking(self.partition_id, &self.runtime.memory_pool);
+
+            let merge_metrics = self
+                .metrics_set
+                .new_final_tracking(self.partition_id, &self.runtime.memory_pool);
+
             let mut streams = vec![];
             if !self.in_mem_batches.is_empty() {
-                let in_mem_stream =
-                    self.in_mem_sort_stream(self.metrics.baseline.intermediate())?;
+                let in_mem_stream = self.in_mem_sort_stream(intermediate_metrics)?;
                 streams.push(in_mem_stream);
             }
 
@@ -187,11 +177,14 @@ impl ExternalSorter {
                 streams,
                 self.schema.clone(),
                 &self.expr,
-                self.metrics.baseline.clone(),
-                self.batch_size,
+                merge_metrics,
+                self.session_config.batch_size(),
             )
         } else if !self.in_mem_batches.is_empty() {
-            let result = self.in_mem_sort_stream(self.metrics.baseline.clone());
+            let tracking_metrics = self
+                .metrics_set
+                .new_final_tracking(self.partition_id, &self.runtime.memory_pool);
+            let result = self.in_mem_sort_stream(tracking_metrics);
             // Report to the memory manager we are no longer using memory
             self.reservation.free();
             result
@@ -201,15 +194,15 @@ impl ExternalSorter {
     }
 
     fn used(&self) -> usize {
-        self.reservation.size()
+        self.metrics.mem_used().value()
     }
 
     fn spilled_bytes(&self) -> usize {
-        self.metrics.spilled_bytes.value()
+        self.metrics.spilled_bytes().value()
     }
 
     fn spill_count(&self) -> usize {
-        self.metrics.spill_count.value()
+        self.metrics.spill_count().value()
     }
 
     async fn spill(&mut self) -> Result<usize> {
@@ -225,9 +218,9 @@ impl ExternalSorter {
         let spillfile = self.runtime.disk_manager.create_tmp_file("Sorting")?;
         let batches = std::mem::take(&mut self.in_mem_batches);
         spill_sorted_batches(batches, spillfile.path(), self.schema.clone()).await?;
-        let used = self.reservation.free();
-        self.metrics.spill_count.add(1);
-        self.metrics.spilled_bytes.add(used);
+        self.reservation.free();
+        let used = self.metrics.mem_used().set(0);
+        self.metrics.record_spill(used);
         self.spills.push(spillfile);
         Ok(used)
     }
@@ -238,8 +231,12 @@ impl ExternalSorter {
             return Ok(());
         }
 
+        let tracking_metrics = self
+            .metrics_set
+            .new_intermediate_tracking(self.partition_id, &self.runtime.memory_pool);
+
         self.in_mem_batches = self
-            .in_mem_sort_stream(self.metrics.baseline.intermediate())?
+            .in_mem_sort_stream(tracking_metrics)?
             .try_collect()
             .await?;
 
@@ -249,6 +246,7 @@ impl ExternalSorter {
             .map(|x| x.get_array_memory_size())
             .sum();
 
+        self.metrics.mem_used().set(size);
         self.reservation.resize(size);
         self.in_mem_batches_sorted = true;
         Ok(())
@@ -257,12 +255,13 @@ impl ExternalSorter {
     /// Consumes in_mem_batches returning a sorted stream
     fn in_mem_sort_stream(
         &mut self,
-        metrics: BaselineMetrics,
+        metrics: MemTrackingMetrics,
     ) -> Result<SendableRecordBatchStream> {
         assert_ne!(self.in_mem_batches.len(), 0);
         if self.in_mem_batches.len() == 1 {
             let batch = self.in_mem_batches.remove(0);
-            let stream = self.sort_batch_stream(batch, metrics)?;
+            let stream =
+                sort_batch_stream(batch, self.expr.clone(), self.fetch, metrics)?;
             self.in_mem_batches.clear();
             return Ok(stream);
         }
@@ -274,14 +273,21 @@ impl ExternalSorter {
             // Concatenate memory batches together and sort
             let batch = concat_batches(&self.schema, &self.in_mem_batches)?;
             self.in_mem_batches.clear();
-            return self.sort_batch_stream(batch, metrics);
+            return sort_batch_stream(batch, self.expr.clone(), self.fetch, metrics);
         }
 
-        let streams = std::mem::take(&mut self.in_mem_batches)
-            .into_iter()
+        let streams = self
+            .in_mem_batches
+            .drain(..)
             .map(|batch| {
-                let metrics = self.metrics.baseline.intermediate();
-                Ok(spawn_buffered(self.sort_batch_stream(batch, metrics)?, 1))
+                let metrics = self.metrics_set.new_intermediate_tracking(
+                    self.partition_id,
+                    &self.runtime.memory_pool,
+                );
+                Ok(spawn_buffered(
+                    sort_batch_stream(batch, self.expr.clone(), self.fetch, metrics)?,
+                    1,
+                ))
             })
             .collect::<Result<_>>()?;
 
@@ -292,34 +298,8 @@ impl ExternalSorter {
             self.schema.clone(),
             &self.expr,
             metrics,
-            self.batch_size,
+            self.session_config.batch_size(),
         )
-    }
-
-    fn sort_batch_stream(
-        &self,
-        batch: RecordBatch,
-        metrics: BaselineMetrics,
-    ) -> Result<SendableRecordBatchStream> {
-        let schema = batch.schema();
-
-        let mut reservation =
-            MemoryConsumer::new(format!("sort_batch_stream{}", self.partition_id))
-                .register(&self.runtime.memory_pool);
-
-        // TODO: This should probably be try_grow (#5885)
-        reservation.resize(batch.get_array_memory_size());
-
-        let fetch = self.fetch;
-        let expressions = self.expr.clone();
-        let stream = futures::stream::once(futures::future::lazy(move |_| {
-            let sorted = sort_batch(&batch, &expressions, fetch)?;
-            metrics.record_output(sorted.num_rows());
-            drop(batch);
-            reservation.free();
-            Ok(sorted)
-        }));
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
@@ -331,6 +311,22 @@ impl Debug for ExternalSorter {
             .field("spill_count", &self.spill_count())
             .finish()
     }
+}
+
+fn sort_batch_stream(
+    batch: RecordBatch,
+    expressions: Arc<[PhysicalSortExpr]>,
+    fetch: Option<usize>,
+    mut tracking_metrics: MemTrackingMetrics,
+) -> Result<SendableRecordBatchStream> {
+    let schema = batch.schema();
+    tracking_metrics.init_mem_used(batch.get_array_memory_size());
+    let stream = futures::stream::once(futures::future::lazy(move |_| {
+        let sorted = sort_batch(&batch, &expressions, fetch)?;
+        tracking_metrics.record_output(sorted.num_rows());
+        Ok(sorted)
+    }));
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
 }
 
 fn sort_batch(
@@ -428,7 +424,7 @@ pub struct SortExec {
     /// Sort expressions
     expr: Vec<PhysicalSortExpr>,
     /// Containing all metrics set created during sort
-    metrics_set: ExecutionPlanMetricsSet,
+    metrics_set: CompositeMetricsSet,
     /// Preserve partitions of input plan. If false, the input partitions
     /// will be sorted and merged into a single output partition.
     preserve_partitioning: bool,
@@ -453,7 +449,7 @@ impl SortExec {
         Self {
             expr,
             input,
-            metrics_set: ExecutionPlanMetricsSet::new(),
+            metrics_set: CompositeMetricsSet::new(),
             preserve_partitioning: false,
             fetch: None,
         }
@@ -590,35 +586,26 @@ impl ExecutionPlan for SortExec {
     ) -> Result<SendableRecordBatchStream> {
         trace!("Start SortExec::execute for partition {} of context session_id {} and task_id {:?}", partition, context.session_id(), context.task_id());
 
-        let mut input = self.input.execute(partition, context.clone())?;
+        let input = self.input.execute(partition, context.clone())?;
 
         trace!("End SortExec's input.execute for partition: {}", partition);
 
-        let mut sorter = ExternalSorter::new(
-            partition,
-            input.schema(),
-            self.expr.clone(),
-            context.session_config().batch_size(),
-            self.fetch,
-            &self.metrics_set,
-            context.runtime_env(),
-        );
-
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            futures::stream::once(async move {
-                while let Some(batch) = input.next().await {
-                    let batch = batch?;
-                    sorter.insert_batch(batch).await?;
-                }
-                sorter.sort()
-            })
+            futures::stream::once(do_sort(
+                input,
+                partition,
+                self.expr.clone(),
+                self.metrics_set.clone(),
+                context,
+                self.fetch(),
+            ))
             .try_flatten(),
         )))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics_set.clone_inner())
+        Some(self.metrics_set.aggregate_all())
     }
 
     fn fmt_as(
@@ -642,6 +629,44 @@ impl ExecutionPlan for SortExec {
     fn statistics(&self) -> Statistics {
         self.input.statistics()
     }
+}
+
+async fn do_sort(
+    mut input: SendableRecordBatchStream,
+    partition_id: usize,
+    expr: Vec<PhysicalSortExpr>,
+    metrics_set: CompositeMetricsSet,
+    context: Arc<TaskContext>,
+    fetch: Option<usize>,
+) -> Result<SendableRecordBatchStream> {
+    trace!(
+        "Start do_sort for partition {} of context session_id {} and task_id {:?}",
+        partition_id,
+        context.session_id(),
+        context.task_id()
+    );
+    let schema = input.schema();
+    let mut sorter = ExternalSorter::new(
+        partition_id,
+        schema.clone(),
+        expr,
+        metrics_set,
+        Arc::new(context.session_config().clone()),
+        context.runtime_env(),
+        fetch,
+    );
+    while let Some(batch) = input.next().await {
+        let batch = batch?;
+        sorter.insert_batch(batch).await?;
+    }
+    let result = sorter.sort();
+    trace!(
+        "End do_sort for partition {} of context session_id {} and task_id {:?}",
+        partition_id,
+        context.session_id(),
+        context.task_id()
+    );
+    result
 }
 
 #[cfg(test)]
