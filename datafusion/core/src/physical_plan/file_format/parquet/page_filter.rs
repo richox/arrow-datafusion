@@ -557,4 +557,9 @@ impl<'a> PruningStatistics for PagesPruningStatistics<'a> {
             ))),
         }
     }
+
+    fn dictionary_values(&self, _column: &datafusion_common::Column) -> Option<ArrayRef> {
+        // dictionary filtering does not work in page pruning
+        None
+    }
 }

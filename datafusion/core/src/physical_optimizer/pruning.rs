@@ -55,6 +55,7 @@ use datafusion_physical_expr::{
 };
 use datafusion_physical_expr::{expressions as phys_expr, PhysicalExprRef, ScalarFunctionExpr};
 use log::trace;
+use datafusion_physical_expr::array_expressions::array_contains;
 
 /// Interface to pass statistics information to [`PruningPredicate`]
 ///
@@ -95,6 +96,9 @@ pub trait PruningStatistics {
     ///
     /// Note: the returned array must contain `num_containers()` rows.
     fn null_counts(&self, column: &Column) -> Option<ArrayRef>;
+
+    /// return dictionary values for the named column as ListArray<?>
+    fn dictionary_values(&self, column: &Column) -> Option<ArrayRef>;
 }
 
 /// Evaluates filter expressions on statistics in order to
@@ -180,7 +184,6 @@ impl PruningPredicate {
         match self.predicate_expr.evaluate(&statistics_batch)? {
             ColumnarValue::Array(array) => {
                 let predicate_array = downcast_value!(array, BooleanArray);
-
                 Ok(predicate_array
                     .into_iter()
                     .map(|x| x.unwrap_or(true)) // None -> true per comments above
@@ -361,6 +364,26 @@ impl RequiredStatColumns {
             "null_count",
         )
     }
+
+    /// rewrite col --> col_dict
+    fn dict_column_expr(
+        &mut self,
+        column: &phys_expr::Column,
+        column_expr: &Arc<dyn PhysicalExpr>,
+        field: &Field,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+
+        let list_type = DataType::List(Arc::new(
+            Field::new("items", field.data_type().clone(), false)
+        ));
+        self.stat_column_expr(
+            column,
+            column_expr,
+            &field.clone().with_data_type(list_type),
+            StatisticsType::Dictionary,
+            "dict",
+        )
+    }
 }
 
 impl From<Vec<(phys_expr::Column, StatisticsType, Field)>> for RequiredStatColumns {
@@ -412,6 +435,7 @@ fn build_statistics_record_batch<S: PruningStatistics>(
             StatisticsType::Min => statistics.min_values(&column),
             StatisticsType::Max => statistics.max_values(&column),
             StatisticsType::NullCount => statistics.null_counts(&column),
+            StatisticsType::Dictionary => statistics.dictionary_values(&column),
         };
         let array = array.unwrap_or_else(|| new_null_array(data_type, num_containers));
 
@@ -524,6 +548,21 @@ impl<'a> PruningExpressionBuilder<'a> {
         self.required_columns
             .max_column_expr(&self.column, &self.column_expr, self.field)
     }
+
+    fn dict_column_expr(&mut self) -> Result<Arc<dyn PhysicalExpr>> {
+        self.required_columns
+            .dict_column_expr(&self.column, &self.column_expr, self.field)
+    }
+
+    fn dict_column_contains_expr(&mut self) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(ScalarFunctionExpr::new(
+            "array_contains",
+            Arc::new(array_contains),
+            vec![self.dict_column_expr()?, self.scalar_expr().clone()],
+            &DataType::Boolean,
+        )))
+    }
+
 }
 
 /// This function is designed to rewrite the column_expr to
@@ -822,12 +861,10 @@ fn build_starts_with_expr(
             &DataType::Utf8,
         ));
 
-        phys_expr::binary(
+        Some(Arc::new(phys_expr::SCAndExpr::new(
             phys_expr::binary(min_prefix, Operator::LtEq, lit_prefix.clone(), schema).ok()?,
-            Operator::And,
             phys_expr::binary(max_prefix, Operator::GtEq, lit_prefix.clone(), schema).ok()?,
-            schema,
-        ).ok()
+        )))
 
     } else {
         None
@@ -894,11 +931,29 @@ fn build_predicate_expression(
                         e.clone(),
                     )) as _
                 })
-                .reduce(|a, b| Arc::new(phys_expr::BinaryExpr::new(a, re_op, b)) as _)
+                .reduce(|a, b| Arc::new(phys_expr::BinaryExpr::new(a, re_op, b)))
                 .unwrap();
             return build_predicate_expression(&change_expr, schema, required_columns);
         } else {
             return unhandled;
+        }
+    }
+    if let Some(sc_and) = expr_any.downcast_ref::<phys_expr::SCAndExpr>() {
+        let left_expr = build_predicate_expression(&sc_and.left, schema, required_columns);
+        let right_expr = build_predicate_expression(&sc_and.right, schema, required_columns);
+        return match (&left_expr, &right_expr) {
+            (l, _) if is_always_true(l) => right_expr,
+            (_, r) if is_always_true(r) => left_expr,
+            (_, _) => Arc::new(phys_expr::SCAndExpr::new(left_expr, right_expr)),
+        };
+    }
+    if let Some(sc_or) = expr_any.downcast_ref::<phys_expr::SCOrExpr>() {
+        let left_expr = build_predicate_expression(&sc_or.left, schema, required_columns);
+        let right_expr = build_predicate_expression(&sc_or.right, schema, required_columns);
+        if is_always_true(&left_expr) || is_always_true(&right_expr) {
+            return unhandled;
+        } else {
+            return Arc::new(phys_expr::SCOrExpr::new(left_expr, right_expr));
         }
     }
     if let Some(scalar_fn) = expr_any.downcast_ref::<ScalarFunctionExpr>() {
@@ -939,7 +994,9 @@ fn build_predicate_expression(
             {
                 unhandled
             }
-            _ => Arc::new(phys_expr::BinaryExpr::new(left_expr, op, right_expr)),
+            (_, Operator::And, _) => Arc::new(phys_expr::SCAndExpr::new(left_expr, right_expr)),
+            (_, Operator::Or, _) => Arc::new(phys_expr::SCOrExpr::new(left_expr, right_expr)),
+            _ => unreachable!(),
         };
         return expr;
     }
@@ -988,7 +1045,7 @@ fn build_statistics_expr(
                 // (column / 2) = 4 => (column_min / 2) <= 4 && 4 <= (column_max / 2)
                 let min_column_expr = expr_builder.min_column_expr()?;
                 let max_column_expr = expr_builder.max_column_expr()?;
-                Arc::new(phys_expr::BinaryExpr::new(
+                let stat_pred_expr = Arc::new(phys_expr::BinaryExpr::new(
                     Arc::new(phys_expr::BinaryExpr::new(
                         min_column_expr,
                         Operator::LtEq,
@@ -1000,6 +1057,15 @@ fn build_statistics_expr(
                         Operator::LtEq,
                         max_column_expr,
                     )),
+                ));
+
+                // append dict_pred expr (stat && dictionary_contains(column))
+                let dict = expr_builder.dict_column_expr()?;
+                let has_no_dict = Arc::new(phys_expr::IsNullExpr::new(dict));
+                let dict_contained = expr_builder.dict_column_contains_expr()?;
+                Arc::new(phys_expr::SCAndExpr::new(
+                    stat_pred_expr,
+                    Arc::new(phys_expr::SCOrExpr::new(has_no_dict, dict_contained))
                 ))
             }
             Operator::Gt => {
@@ -1049,6 +1115,7 @@ pub(crate) enum StatisticsType {
     Min,
     Max,
     NullCount,
+    Dictionary,
 }
 
 #[cfg(test)]
