@@ -41,6 +41,7 @@ use datafusion_physical_expr::PhysicalSortExpr;
 use fmt::Debug;
 use std::any::Any;
 use std::cmp::min;
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::ops::Range;
@@ -501,7 +502,8 @@ impl FileOpener for ParquetOpener {
         let limit = self.limit;
 
         Ok(Box::pin(async move {
-            let options = ArrowReaderOptions::new().with_page_index(enable_page_index);
+            // dictionary filtering always need page indices
+            let options = ArrowReaderOptions::new().with_page_index(true);
             let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
                     .await?;
@@ -542,11 +544,25 @@ impl FileOpener for ParquetOpener {
 
             // Row group pruning: attempt to skip entire row_groups
             // using metadata on the row groups
-            let file_metadata = builder.metadata();
+            // first run without dictionary filtering, to reduce io to dictionary pages
+            let file_metadata = builder.metadata().clone();
             let row_groups = row_groups::prune_row_groups(
-                file_metadata.row_groups(),
-                file_range,
+                &mut builder,
+                &file_metadata,
+                &HashSet::from_iter(0..file_metadata.row_groups().len()),
+                file_range.clone(),
                 pruning_predicate.as_ref().map(|p| p.as_ref()),
+                false,
+                &file_metrics,
+            );
+            // second run with dictionary filtering
+            let row_groups = row_groups::prune_row_groups(
+                &mut builder,
+                &file_metadata,
+                &HashSet::from_iter(row_groups),
+                file_range.clone(),
+                pruning_predicate.as_ref().map(|p| p.as_ref()),
+                true,
                 &file_metrics,
             );
 
