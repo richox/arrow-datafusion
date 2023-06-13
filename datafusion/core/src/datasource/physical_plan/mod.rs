@@ -198,7 +198,7 @@ impl FileScanConfig {
                 table_fields.push(Field::new(
                     &self.table_partition_cols[partition_idx].0,
                     self.table_partition_cols[partition_idx].1.to_owned(),
-                    false,
+                    true,
                 ));
                 // TODO provide accurate stat for partition column (#1186)
                 table_cols_stats.push(ColumnStatistics::default())
