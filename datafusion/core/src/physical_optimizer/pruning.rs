@@ -771,6 +771,9 @@ fn build_is_null_column_expr(
 ) -> Option<Arc<dyn PhysicalExpr>> {
     if let Some(col) = expr.as_any().downcast_ref::<phys_expr::Column>() {
         let field = schema.field_with_name(col.name()).ok()?;
+        if field.data_type().is_nested() {
+            return None;
+        }
 
         let null_count_field = &Field::new(field.name(), DataType::UInt64, true);
         let null_count_column_expr = required_columns
@@ -798,6 +801,9 @@ fn build_is_not_null_column_expr(
 ) -> Option<Arc<dyn PhysicalExpr>> {
     if let Some(col) = expr.as_any().downcast_ref::<phys_expr::Column>() {
         let field = schema.field_with_name(col.name()).ok()?;
+        if field.data_type().is_nested() {
+            return None;
+        }
 
         let null_count_field = &Field::new(field.name(), DataType::UInt64, true);
         let null_count_column_expr = required_columns
