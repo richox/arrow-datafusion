@@ -34,7 +34,7 @@ use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::{
     metadata::RowGroupMetaData, statistics::Statistics as ParquetStatistics,
 };
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 
 use crate::datasource::physical_plan::parquet::{
     from_bytes_to_i128, parquet_to_arrow_decimal_type,
@@ -226,7 +226,7 @@ macro_rules! get_min_max_values {
         $self.row_group_metadata
             .columns()
             .iter()
-            .find(|c| c.column_descr().name().eq_ignore_ascii_case(&$column.name))
+            .find(|c| c.column_path().string().eq_ignore_ascii_case(&$column.flat_name()))
             .and_then(|c| if c.statistics().is_some() {Some((c.statistics().unwrap(), c.column_descr()))} else {None})
             .map(|(stats, column_descr)|
                 {
@@ -248,7 +248,7 @@ macro_rules! get_null_count_values {
                 .row_group_metadata
                 .columns()
                 .iter()
-                .find(|c| c.column_descr().name().eq_ignore_ascii_case(&$column.name))
+                .find(|c| c.column_path().string().eq_ignore_ascii_case(&$column.flat_name()))
             {
                 col.statistics().map(|s| s.null_count())
             } else {
@@ -290,7 +290,7 @@ impl<'a, T: AsyncFileReader + Send + 'static> PruningStatistics for RowGroupPrun
             .row_group_metadata
             .columns()
             .iter()
-            .position(|c| c.column_descr().name().eq_ignore_ascii_case(&column.name))?;
+            .position(|c| c.column_path().string().eq_ignore_ascii_case(&column.flat_name()))?;
 
         self.cached_dictionaries[col_idx].get_or_init(|| {
             let dict_values = match futures::executor::block_on(async move {
