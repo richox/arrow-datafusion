@@ -173,6 +173,9 @@ impl PruningPredicate {
         let statistics_batch =
             build_statistics_record_batch(statistics, &self.required_columns)?;
 
+        let pp = arrow::util::pretty::pretty_format_batches(&[statistics_batch.clone()])?.to_string();
+        eprintln!("stat batch:\n{}", pp);
+
         // Evaluate the pruning predicate on that record batch.
         //
         // Use true when the result of evaluating a predicate
@@ -1067,10 +1070,11 @@ fn build_statistics_expr(
 
                 // append dict_pred expr (stat && dictionary_contains(column))
                 let dict = expr_builder.dict_column_expr()?;
+                let has_no_stat_pred = Arc::new(phys_expr::IsNullExpr::new(stat_pred_expr.clone()));
                 let has_no_dict = Arc::new(phys_expr::IsNullExpr::new(dict));
                 let dict_contained = expr_builder.dict_column_contains_expr()?;
                 Arc::new(phys_expr::SCAndExpr::new(
-                    stat_pred_expr,
+                    Arc::new(phys_expr::SCOrExpr::new(has_no_stat_pred, stat_pred_expr)),
                     Arc::new(phys_expr::SCOrExpr::new(has_no_dict, dict_contained))
                 ))
             }
