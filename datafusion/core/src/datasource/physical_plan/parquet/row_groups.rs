@@ -260,6 +260,19 @@ macro_rules! get_null_count_values {
     }};
 }
 
+macro_rules! is_min_max_deprecated {
+    ($self:expr, $column:expr) => {{
+        $self
+            .row_group_metadata
+            .columns()
+            .iter()
+            .find(|c| c.column_path().string().eq_ignore_ascii_case(&$column.flat_name()))
+            .and_then(|c| c.statistics())
+            .map(|stat| stat.is_min_max_deprecated())
+            .unwrap_or(false)
+    }}
+}
+
 impl<'a, T: AsyncFileReader + Send + 'static> PruningStatistics for RowGroupPruningStatistics<'a, T> {
     fn num_rows(&self, _column: &Column) -> Option<ArrayRef> {
         let num_rows = self.row_group_metadata.num_rows();
@@ -267,10 +280,28 @@ impl<'a, T: AsyncFileReader + Send + 'static> PruningStatistics for RowGroupPrun
     }
 
     fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        if is_min_max_deprecated!(self, column) {
+            // use deprecated min/max values only when min == max
+            let min_values = get_min_max_values!(self, column, min, min_bytes);
+            let max_values = get_min_max_values!(self, column, max, max_bytes);
+            if min_values == max_values {
+                return min_values;
+            }
+            return None;
+        }
         get_min_max_values!(self, column, min, min_bytes)
     }
 
     fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        if is_min_max_deprecated!(self, column) {
+            // use deprecated min/max values only when min == max
+            let min_values = get_min_max_values!(self, column, min, min_bytes);
+            let max_values = get_min_max_values!(self, column, max, max_bytes);
+            if min_values == max_values {
+                return max_values;
+            }
+            return None;
+        }
         get_min_max_values!(self, column, max, max_bytes)
     }
 
