@@ -14,13 +14,14 @@
 
 use std::any::Any;
 use std::fmt::{Display, Formatter};
+use std::hash::Hasher;
 use std::sync::Arc;
 use arrow::array::*;
 use arrow::compute;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{DataFusionError, Result, ScalarValue};
-use datafusion_expr::{ColumnarValue, Operator};
+use datafusion_expr::ColumnarValue;
 use crate::physical_expr::down_cast_any_ref;
 use crate::PhysicalExpr;
 
@@ -82,6 +83,11 @@ impl PhysicalExpr for SCAndExpr {
             children[1].clone(),
         )))
     }
+
+    fn dyn_hash(&self, state: &mut dyn Hasher) {
+        self.left.dyn_hash(state);
+        self.right.dyn_hash(state);
+    }
 }
 
 /// Computes logical AND with short circuiting
@@ -141,6 +147,11 @@ impl PhysicalExpr for SCOrExpr {
             children[0].clone(),
             children[1].clone(),
         )))
+    }
+
+    fn dyn_hash(&self, state: &mut dyn Hasher) {
+        self.left.dyn_hash(state);
+        self.right.dyn_hash(state);
     }
 }
 

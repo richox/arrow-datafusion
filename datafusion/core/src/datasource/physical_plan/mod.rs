@@ -33,7 +33,6 @@ pub use self::parquet::{ParquetExec, ParquetFileMetrics, ParquetFileReaderFactor
 use arrow::{
     array::{new_null_array, ArrayData, ArrayRef, BufferBuilder, DictionaryArray},
     buffer::Buffer,
-    compute::can_cast_types,
     datatypes::{ArrowNativeType, DataType, Field, Schema, SchemaRef, UInt16Type},
     record_batch::{RecordBatch, RecordBatchOptions},
 };
@@ -61,7 +60,6 @@ use crate::{
 use datafusion_common::tree_node::{TreeNode, VisitRecursion};
 use datafusion_physical_expr::expressions::Column;
 
-use arrow::compute::cast;
 use log::{debug, warn};
 use object_store::path::Path;
 use object_store::ObjectMeta;
@@ -501,12 +499,13 @@ impl SchemaAdapter {
         let mut field_mappings = vec![None; self.table_schema.fields().len()];
 
         for (file_idx, file_field) in file_schema.fields.iter().enumerate() {
-            if let Some((table_idx, table_field)) = self.table_schema
+            if let Some((table_idx, _table_field)) = self.table_schema
                 .fields()
                 .iter()
                 .enumerate()
-                .find(|(_, b)| b.name().eq_ignore_ascii_case(name))
+                .find(|(_, b)| b.name().eq_ignore_ascii_case(file_field.name()))
             {
+                // blaze: no need to check with can_cast_types()
                 field_mappings[table_idx] = Some(projection.len());
                 projection.push(file_idx);
             }
