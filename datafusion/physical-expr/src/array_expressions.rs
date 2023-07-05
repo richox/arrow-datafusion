@@ -157,13 +157,13 @@ pub fn array_contains(values: &[ColumnarValue]) -> Result<ColumnarValue> {
     // slow implementation, only used in parquet dictionary filtering
     let arg1 = values[0].clone().into_array(1);
     let arg2 = values[1].clone().into_array(arg1.len());
-    let list = as_list_array(&arg1);
+    let list = as_list_array(&arg1)?;
 
     macro_rules! handle_primitive {
         ($dt:ident) => {{
             use arrow::datatypes::*;
             let value: &PrimitiveArray<$dt> = as_primitive_array(&arg2);
-            return Ok(ColumnarValue::Array(Arc::new(arrow::compute::contains(value, list)?)));
+            return Ok(ColumnarValue::Array(Arc::new(arrow::compute::in_list(value, list)?)));
         }}
     }
     match arg2.data_type() {

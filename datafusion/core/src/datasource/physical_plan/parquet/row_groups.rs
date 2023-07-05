@@ -34,7 +34,7 @@ use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::file::{
     metadata::RowGroupMetaData, statistics::Statistics as ParquetStatistics,
 };
-use parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
+use parquet::file::metadata::ParquetMetaData;
 
 use crate::datasource::physical_plan::parquet::{
     from_bytes_to_i128, parquet_to_arrow_decimal_type,
