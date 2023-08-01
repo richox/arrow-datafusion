@@ -316,7 +316,7 @@ pub fn down_cast_any_ref(any: &dyn Any) -> &dyn Any {
 /// # Arguments
 /// * `mask` - Boolean values used to determine where to put the `truthy` values
 /// * `truthy` - All values of this array are to scatter according to `mask` into final result.
-fn scatter(mask: &BooleanArray, truthy: &dyn Array) -> Result<ArrayRef> {
+pub fn scatter(mask: &BooleanArray, truthy: &dyn Array) -> Result<ArrayRef> {
     let truthy = truthy.to_data();
 
     // update the mask so that any null values become false
